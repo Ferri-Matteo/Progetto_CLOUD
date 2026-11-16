@@ -1,0 +1,69 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+    ============================================================================
+    pom.xml - Progetto_CLOUD
+
+    Build Maven del progetto: cluster Kafka ad alta disponibilità con mTLS,
+    applicazioni di produzione/consumo ordini e classi di simulazione attacchi.
+
+    COMANDI PRINCIPALI
+      mvn compile                                   compila tutte le classi
+      mvn exec:java "-Dexec.mainClass=<classe>"     esegue una classe
+          es.: org.example.OrderDispatcherProducer
+               org.example.Sicurezza.SimulazioneAttacchi.NoCertAttacker
+
+    REQUISITI
+      - JDK 17 o superiore (maven.compiler.source/target = 17)
+      - Il cluster Kafka in Docker deve essere attivo per le esecuzioni reali
+    ============================================================================
+-->
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <!-- Coordinate del progetto: identificano l'artefatto Maven -->
+    <groupId>org.example</groupId>
+    <artifactId>Progetto_CLOUD</artifactId>
+    <version>1.0-SNAPSHOT</version>
+
+    <properties>
+        <!-- Versione Java del codice sorgente e del bytecode generato.
+             Deve essere almeno 17: le classi usano Map.of() e le text block-compatibili API. -->
+        <maven.compiler.source>17</maven.compiler.source>
+        <maven.compiler.target>17</maven.compiler.target>
+
+        <!-- Codifica dei sorgenti: evita problemi con i caratteri accentati nei commenti
+             e nelle stringhe in italiano. -->
+        <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+    </properties>
+
+    <dependencies>
+        <!--
+            Kafka clients: producer, consumer, AdminClient e le classi per le ACL.
+            La versione 3.7.0 deve coincidere con l'immagine Docker apache/kafka:3.7.0
+            usata dal cluster, altrimenti il protocollo potrebbe non essere compatibile.
+        -->
+        <dependency>
+            <groupId>org.apache.kafka</groupId>
+            <artifactId>kafka-clients</artifactId>
+            <version>3.7.0</version>
+        </dependency>
+
+        <!--
+            Implementazione di SLF4J. Senza di essa, kafka-clients usa il logger NOP
+            e non stampa nulla, anche in caso di errore SSL o di autorizzazione.
+            La versione 1.7.36 è quella compatibile con kafka-clients 3.7.0: la 2.x non
+            è supportata da questa versione del client.
+
+            Le classi del progetto impostano org.slf4j.simpleLogger.defaultLogLevel=warn
+            per ridurre i messaggi INFO. Questa proprietà è letta solo da slf4j-simple.
+        -->
+        <dependency>
+            <groupId>org.slf4j</groupId>
+            <artifactId>slf4j-simple</artifactId>
+            <version>1.7.36</version>
+        </dependency>
+    </dependencies>
+
+</project>

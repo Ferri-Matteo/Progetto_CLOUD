@@ -1,0 +1,132 @@
+# Progetto_CLOUD: cluster Kafka Zero-Trust ad alta disponibilità con mTLS
+
+Infrastruttura di streaming su Apache Kafka progettata per mostrare tre proprietà non funzionali di un sistema distribuito: **tolleranza ai guasti**, **alta disponibilità** e **sicurezza** (autenticazione reciproca, autorizzazione a privilegi minimi e rilevamento delle intrusioni).
+
+Il progetto contiene un cluster Kafka a 3 nodi in Docker, due applicazioni Java (producer e consumer di ordini), una console di monitoraggio che applica revoche dinamiche tramite ACL, e alcune classi di simulazione degli attacchi.
+
+---
+
+# Kafka Zero-Trust: cluster sicuro con IDS stateful
+
+Infrastruttura di streaming su Apache Kafka che mostra tre proprietà non funzionali dei sistemi distribuiti: **alta disponibilità**, **tolleranza ai guasti** e **sicurezza**.
+
+Il componente principale è una console di rilevamento (IDS) che applica una politica Zero Trust: blocca i flood (DoS) e la clonazione di identità revocando dinamicamente i permessi tramite ACL Kafka.
+
+## Caratteristiche
+
+**Infrastruttura (HA e FT)**
+- Cluster Kafka a 3 nodi in Docker Compose (modalità KRaft).
+- Topic `secure-orders` con fattore di replica 3 e `min.insync.replicas=2`.
+
+**Sicurezza**
+- mTLS: ogni client deve presentare un certificato firmato dalla CA del progetto.
+- Permessi minimi: `OrderProducer` può solo scrivere, `OrderConsumer` può solo leggere.
+- Zero Trust: senza un'ACL esplicita, ogni accesso è negato.
+
+**Console di rilevamento (EnterpriseDefenseConsole)**
+- All'avvio crea le regole di base per producer e consumer.
+- Rileva flood superiori a 2000 msg/sec e applica un blocco globale.
+- Rileva replay di sequenze già viste e salti di numerazione sospetti.
+- Ripristino manuale dei permessi con **RESTORE PERMISSIONS**.
+
+## Prerequisiti
+
+- Docker Desktop
+- JDK 17 e Maven
+- Git Bash (o WSL) con `openssl` e `keytool`
+
+## Avvio
+
+**Prerequisiti:** Docker Desktop attivo, JDK 17, Git Bash. Prima di iniziare, verificare che non siano in esecuzione processi Java residui (`jps -l`).
+
+**1. Certificati** (solo se si rigenera la PKI, dalla radice del progetto)
+
+```bash
+rm -f sicurezza/certs/*
+bash sicurezza/generate-certs.sh
+```
+
+Dopo una rigenerazione la CA cambia: il cluster va ricreato.
+
+**2. Cluster**
+
+```bash
+docker compose up -d
+docker compose ps
+```
+
+Attendere che i tre container siano `Up`.
+
+**3. Topic** (solo dopo la creazione del cluster)
+
+```bash
+MSYS_NO_PATHCONV=1 docker exec -it kafka1 /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka1:9092 --command-config /etc/kafka/secrets/admin.properties --create --topic secure-orders --partitions 3 --replication-factor 3
+```
+
+**4. Console di rilevamento**
+
+Avviare `EnterpriseDefenseConsole` dalla radice del progetto e attendere:
+
+```
+[SYSTEM] Baseline ALLOW rules applied successfully.
+[SYSTEM] Security Engine initialized. Protocol and State verification active.
+```
+
+La console crea le ACL di scrittura del producer e di lettura del consumer sul topic.
+
+**5. ACL del gruppo del consumer**
+
+La console non la crea, quindi va aggiunta a mano:
+
+```bash
+MSYS_NO_PATHCONV=1 docker exec -it kafka1 /opt/kafka/bin/kafka-acls.sh --bootstrap-server kafka1:9092 --command-config /etc/kafka/secrets/admin.properties --add --allow-principal "User:CN=OrderConsumer,OU=IT,O=Cloud,L=Milano,C=IT" --operation Read --group ecommerce-dispatch-group
+```
+
+**6. ACL del transactional id** (solo per `FullAccessAttacker`)
+
+```bash
+MSYS_NO_PATHCONV=1 docker exec -it kafka1 /opt/kafka/bin/kafka-acls.sh --bootstrap-server kafka1:9092 --command-config /etc/kafka/secrets/admin.properties --add --allow-principal "User:CN=OrderProducer,OU=IT,O=Cloud,L=Milano,C=IT" --operation Write --operation Describe --transactional-id prod-order-01
+```
+
+**7. Verifica delle ACL**
+
+```bash
+MSYS_NO_PATHCONV=1 docker exec -it kafka1 /opt/kafka/bin/kafka-acls.sh --bootstrap-server kafka1:9092 --command-config /etc/kafka/secrets/admin.properties --list
+```
+
+Devono comparire gli ALLOW di scrittura del producer e di lettura del consumer sul topic, e quello di lettura del consumer sul gruppo. Non devono comparire DENY.
+
+**8. Applicazioni**
+
+Avviare nell'ordine: `OrderDispatcherConsumer`, poi `OrderDispatcherProducer`.
+
+**Nota:** `docker compose down -v` cancella topic, ACL e dati. Dopo ogni ricreazione dei container ripetere i passi da 2 a 7.
+
+## Simulazione degli attacchi
+
+| Classe | Attacco | Risposta del sistema |
+|---|---|---|
+| `NoCertAttacker` | connessione senza certificato | il broker rifiuta l'handshake SSL |
+| `FullAccessAttacker` | replay con il certificato del producer | rilevato se il numero di sequenza è già stato visto: revoca dei permessi |
+| `DoSAttacker` | flood di messaggi | oltre 2000 msg/sec: blocco globale |
+
+**Nota:** la revoca colpisce il certificato, quindi blocca anche il producer legittimo. Per tornare alla situazione normale usare **RESTORE PERMISSIONS**.
+
+## Struttura
+
+```
+sicurezza/
+├── generate-certs.sh     generazione della CA e dei keystore
+└── certs/                certificati e file di configurazione (non versionare)
+src/main/java/org/example/
+├── OrderDispatcherProducer.java
+├── OrderDispatcherConsumer.java
+└── Sicurezza/
+    ├── EnterpriseDefenseConsole.java
+    └── SimulazioneAttacchi/
+        ├── NoCertAttacker.java
+        ├── FullAccessAttacker.java
+        └── DoSAttacker.java
+docker-compose.yml        configurazione del cluster
+pom.xml
+```

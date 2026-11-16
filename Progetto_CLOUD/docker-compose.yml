@@ -1,0 +1,258 @@
+# ==============================================================================
+# docker-compose.yml - Cluster Kafka a 3 nodi (KRaft) con mTLS e ACL
+#
+# Avvio:     docker compose up -d
+# Stato:     docker compose ps
+# Arresto:   docker compose down        (conserva i dati)
+#            docker compose down -v     (cancella dati e metadati: ACL incluse)
+#
+# ARCHITETTURA
+#   - Tre container (kafka1, kafka2, kafka3), ciascuno con ruolo broker + controller.
+#   - Quorum KRaft a 3 controller: il cluster sopravvive alla perdita di un nodo.
+#   - Rete Docker dedicata "kafka-secure-net": i nodi si parlano per nome host.
+#   - kafka-ui: interfaccia web su http://localhost:8080, connessa come client mTLS.
+#
+# PORTE ESPOSTE SUL PC
+#   9093 -> kafka1 (listener EXTERNAL, SSL)
+#   9095 -> kafka2 (listener EXTERNAL, SSL)
+#   9096 -> kafka3 (listener EXTERNAL, SSL)
+#   8080 -> kafka-ui
+#   La porta 9092 (INTERNAL) e 9094 (CONTROLLER) non sono esposte: sono usate solo
+#   dentro la rete Docker.
+#
+# LISTENER
+#   INTERNAL   0.0.0.0:9092   tra broker e client interni alla rete Docker, SSL
+#   EXTERNAL   0.0.0.0:9093   dal PC host (localhost), SSL
+#   CONTROLLER 0.0.0.0:9094   quorum KRaft tra i controller, PLAINTEXT
+#
+# SICUREZZA
+#   - mTLS: il client deve presentare un certificato firmato dalla CA del cluster
+#     (KAFKA_SSL_CLIENT_AUTH=required).
+#   - Il principal di ogni client è il Subject del suo certificato (es.
+#     User:CN=OrderProducer,OU=IT,O=Cloud,L=Milano,C=IT).
+#   - Authorizer StandardAuthorizer: le autorizzazioni sono salvate come ACL nei
+#     metadati del cluster. La dashboard le crea e le revoca a runtime.
+#   - Super user: identità che bypassano le ACL (nodi e SecurityAdmin).
+#
+# I VALORI DEI DN DEVONO COINCIDERE CON QUELLI GENERATI DA generate-certs.sh,
+# altrimenti i super user non vengono riconosciuti.
+#
+# NOTA SU CLUSTER_ID
+#   Identificativo del cluster KRaft. Deve essere lo stesso su tutti i nodi.
+#   Se cambia, i dati esistenti non sono più validi: serve docker compose down -v.
+# ==============================================================================
+
+# ------------------------------------------------------------------------------
+# Variabili comuni a tutti i broker, riusate tramite l'ancora &kafka-env
+# ------------------------------------------------------------------------------
+x-kafka-env: &kafka-env
+  # Identificativo unico del cluster KRaft (uguale su tutti i nodi)
+  CLUSTER_ID: 'MkU3OEVBNTcwNTJENDM2Qk'
+  
+  # Ogni nodo è sia broker sia controller
+  KAFKA_PROCESS_ROLES: 'broker,controller'
+
+  # Quorum dei controller: indirizzi host:porta dei tre nodi, porta 9094 interna
+  KAFKA_CONTROLLER_LISTENER_NAMES: 'CONTROLLER'
+  KAFKA_CONTROLLER_QUORUM_VOTERS: '1@kafka1:9094,2@kafka2:9094,3@kafka3:9094'
+ 
+  # Mappa dei protocolli: il quorum dei controller è in chiaro, client e broker in SSL
+  KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: 'CONTROLLER:PLAINTEXT,INTERNAL:SSL,EXTERNAL:SSL'
+
+  # Il traffico tra broker passa dal listener INTERNAL (SSL)
+  KAFKA_INTER_BROKER_LISTENER_NAME: 'INTERNAL'
+
+  # Porte su cui ogni nodo si mette in ascolto (0.0.0.0 = tutte le interfacce del container)
+  KAFKA_LISTENERS: 'INTERNAL://0.0.0.0:9092,EXTERNAL://0.0.0.0:9093,CONTROLLER://0.0.0.0:9094'
+
+  # Indirizzi pubblicati ai client. Sovrascritti in ogni servizio con l'host corretto.
+  KAFKA_ADVERTISED_LISTENERS: 'INTERNAL://kafka1:9092,EXTERNAL://localhost:9093'
+
+  # Topic creati solo esplicitamente, con i parametri di affidabilità del progetto
+  KAFKA_AUTO_CREATE_TOPICS_ENABLE: 'false'
+
+  # Replica: ogni partizione ha 3 copie
+  KAFKA_DEFAULT_REPLICATION_FACTOR: 3
+
+  # Minimo di repliche sincronizzate per accettare una scrittura con acks=all.
+  # Con 2, il cluster tollera la caduta di un nodo ma si ferma se ne cadono due.
+  KAFKA_MIN_INSYNC_REPLICAS: 2 
+
+  # Topic interni: offset dei consumer e log delle transazioni, replicati su 3 nodi
+  KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 3
+  KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 3
+  KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 2
+
+  # Nessun leader fuori sincronia: meglio fermarsi che perdere dati
+  KAFKA_UNCLEAN_LEADER_ELECTION_ENABLE: 'false'
+
+  # Keystore e truststore usati dal broker per il suo lato TLS.
+  # Il keystore del singolo nodo è indicato in ogni servizio (KAFKA_SSL_KEYSTORE_LOCATION).
+  KAFKA_SSL_KEYSTORE_TYPE: 'JKS'
+  KAFKA_SSL_KEYSTORE_PASSWORD: 'KafkaSecurePass123'
+  KAFKA_SSL_KEY_PASSWORD: 'KafkaSecurePass123'
+  KAFKA_SSL_TRUSTSTORE_TYPE: 'JKS'
+  KAFKA_SSL_TRUSTSTORE_LOCATION: '/etc/kafka/secrets/kafka.truststore.jks'
+  KAFKA_SSL_TRUSTSTORE_PASSWORD: 'KafkaSecurePass123'
+
+  # mTLS obbligatorio: il broker rifiuta i client senza certificato valido
+  KAFKA_SSL_CLIENT_AUTH: 'required'
+
+  # Vuoto: disattiva il controllo del nome host nel certificato, perché il cluster
+  # è raggiunto tramite localhost mentre i certificati sono emessi per i nomi dei container.
+  # La verifica della catena della CA resta attiva.
+  KAFKA_SSL_ENDPOINT_IDENTIFICATION_ALGORITHM: ''
+
+  # ----------------------------------------------------------------------------
+  # Authorizer e super user
+  # ----------------------------------------------------------------------------
+  # Autorizzatore basato su ACL salvate nei metadati del cluster
+  KAFKA_AUTHORIZER_CLASS_NAME: 'org.apache.kafka.metadata.authorizer.StandardAuthorizer'
+  
+# Zero-trust: nessuna risorsa è accessibile senza ACL esplicita.
+# Le ACL vengono create dalla dashboard (topic secure-orders) e manualmente
+# (gruppo ecommerce-dispatch-group, transactional id prod-order-01,
+# eventuale IdempotentWrite del producer)
+  KAFKA_ALLOW_EVERYONE_IF_NO_ACL_FOUND: 'false'
+
+  # Identità che bypassano le ACL: i tre broker, la dashboard (SecurityAdmin) e
+  # ANONYMOUS, necessario perché il listener CONTROLLER è in PLAINTEXT e le sue
+  # richieste arrivano senza principal.
+  KAFKA_SUPER_USERS: 'User:CN=kafka1,OU=CloudComputing,O=Unimi,L=Milan,C=IT;User:CN=kafka2,OU=CloudComputing,O=Unimi,L=Milan,C=IT;User:CN=kafka3,OU=CloudComputing,O=Unimi,L=Milan,C=IT;User:CN=SecurityAdmin,OU=IT,O=Cloud,L=Milano,C=IT;User:ANONYMOUS'
+
+# ------------------------------------------------------------------------------
+# Impostazioni comuni a tutti i servizi Kafka
+# ------------------------------------------------------------------------------
+x-kafka-common: &kafka-common
+  # Immagine ufficiale Apache Kafka: stessa versione dei client Java (3.7.0)
+  image: apache/kafka:3.7.0
+  # Riavvio automatico dei broker dopo un arresto anomalo o un riavvio di Docker.
+  # unless-stopped è scelto al posto di "always": un container fermato a mano
+  # con "docker stop" resta fermo, e così il test di guasto di un singolo nodo
+  # non viene annullato da Docker. "always" lo riavvierebbe subito.
+  restart: unless-stopped
+  networks:
+    - kafka-secure-net
+
+
+services:
+  # --------------------------------------------------------------------------
+  # Broker/controller 1
+  # --------------------------------------------------------------------------
+  kafka1:
+    <<: *kafka-common
+    container_name: kafka1
+    hostname: kafka1
+    ports:
+      # Porta EXTERNAL del nodo 1, raggiungibile da localhost:9093
+      - "9093:9093"
+    environment:
+      <<: *kafka-env
+      KAFKA_NODE_ID: 1
+      KAFKA_ADVERTISED_LISTENERS: 'INTERNAL://kafka1:9092,EXTERNAL://localhost:9093'
+      KAFKA_SSL_KEYSTORE_FILENAME: 'kafka1.keystore.jks'
+      KAFKA_SSL_KEYSTORE_LOCATION: '/etc/kafka/secrets/kafka1.keystore.jks'
+    volumes:
+      # Keystore del nodo e truststore comune
+      - ./sicurezza/certs/kafka1.keystore.jks:/etc/kafka/secrets/kafka1.keystore.jks
+      - ./sicurezza/certs/kafka.truststore.jks:/etc/kafka/secrets/kafka.truststore.jks
+      # client.properties: configurazione SSL per i comandi kafka-*.sh eseguiti nel container
+      - ./sicurezza/certs/client.properties:/etc/kafka/secrets/client.properties
+      # Keystore client generico (CN=ClientApp), usato dalla configurazione client
+      - ./sicurezza/certs/client.keystore.jks:/etc/kafka/secrets/client.keystore.jks
+      # Identità amministrativa per i comandi kafka-topics.sh e kafka-acls.sh
+      # eseguiti dentro il container con --command-config /etc/kafka/secrets/admin.properties.
+      # admin.properties punta a SecurityAdmin.keystore.jks, che è super user:
+      # serve perché ALLOW_EVERYONE_IF_NO_ACL_FOUND=false impedisce a ClientApp
+      # (client.keystore.jks) di creare topic o modificare ACL.
+      # Il keystore va montato insieme al file .properties, altrimenti il percorso
+      # referenziato non esiste nel container.
+      - ./sicurezza/certs/admin.properties:/etc/kafka/secrets/admin.properties
+      - ./sicurezza/certs/SecurityAdmin.keystore.jks:/etc/kafka/secrets/SecurityAdmin.keystore.jks
+
+  # --------------------------------------------------------------------------
+  # Broker/controller 2
+  # --------------------------------------------------------------------------
+  kafka2:
+    <<: *kafka-common
+    container_name: kafka2
+    hostname: kafka2
+    ports:
+      # Porta EXTERNAL del nodo 2, raggiungibile da localhost:9095
+      - "9095:9093"
+    environment:
+      <<: *kafka-env
+      KAFKA_NODE_ID: 2
+      KAFKA_ADVERTISED_LISTENERS: 'INTERNAL://kafka2:9092,EXTERNAL://localhost:9095'
+      KAFKA_SSL_KEYSTORE_FILENAME: 'kafka2.keystore.jks'
+      KAFKA_SSL_KEYSTORE_LOCATION: '/etc/kafka/secrets/kafka2.keystore.jks'
+    volumes:
+      - ./sicurezza/certs/kafka2.keystore.jks:/etc/kafka/secrets/kafka2.keystore.jks
+      - ./sicurezza/certs/kafka.truststore.jks:/etc/kafka/secrets/kafka.truststore.jks
+      - ./sicurezza/certs/client.properties:/etc/kafka/secrets/client.properties
+      - ./sicurezza/certs/client.keystore.jks:/etc/kafka/secrets/client.keystore.jks
+      - ./sicurezza/certs/admin.properties:/etc/kafka/secrets/admin.properties
+      - ./sicurezza/certs/SecurityAdmin.keystore.jks:/etc/kafka/secrets/SecurityAdmin.keystore.jks
+
+  # --------------------------------------------------------------------------
+  # Broker/controller 3
+  # --------------------------------------------------------------------------
+  kafka3:
+    <<: *kafka-common
+    container_name: kafka3
+    hostname: kafka3
+    ports:
+      # Porta EXTERNAL del nodo 3, raggiungibile da localhost:9096
+      - "9096:9093"
+    environment:
+      <<: *kafka-env
+      KAFKA_NODE_ID: 3
+      KAFKA_ADVERTISED_LISTENERS: 'INTERNAL://kafka3:9092,EXTERNAL://localhost:9096'
+      KAFKA_SSL_KEYSTORE_FILENAME: 'kafka3.keystore.jks'
+      KAFKA_SSL_KEYSTORE_LOCATION: '/etc/kafka/secrets/kafka3.keystore.jks'
+    volumes:
+      - ./sicurezza/certs/kafka3.keystore.jks:/etc/kafka/secrets/kafka3.keystore.jks
+      - ./sicurezza/certs/kafka.truststore.jks:/etc/kafka/secrets/kafka.truststore.jks
+      - ./sicurezza/certs/client.properties:/etc/kafka/secrets/client.properties
+      - ./sicurezza/certs/client.keystore.jks:/etc/kafka/secrets/client.keystore.jks
+      - ./sicurezza/certs/admin.properties:/etc/kafka/secrets/admin.properties
+      - ./sicurezza/certs/SecurityAdmin.keystore.jks:/etc/kafka/secrets/SecurityAdmin.keystore.jks
+
+  # --------------------------------------------------------------------------
+  # Interfaccia web di gestione del cluster
+  # Apri http://localhost:8080. Si collega al listener INTERNAL (SSL, porta 9092)
+  # come client mTLS, con il keystore client generico (CN=ClientApp).
+  # Non è super user: vede solo ciò che le ACL consentono.
+  # --------------------------------------------------------------------------
+  kafka-ui:
+    image: provectuslabs/kafka-ui:latest
+    container_name: kafka-ui
+    depends_on:
+      - kafka1
+      - kafka2
+      - kafka3
+    ports:
+      - "8080:8080"
+    environment:
+      KAFKA_CLUSTERS_0_NAME: TheFortress
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka1:9092,kafka2:9092,kafka3:9092
+      KAFKA_CLUSTERS_0_PROPERTIES_SECURITY_PROTOCOL: SSL
+      KAFKA_CLUSTERS_0_PROPERTIES_SSL_TRUSTSTORE_LOCATION: /etc/kafka-ui/ssl/kafka.truststore.jks
+      KAFKA_CLUSTERS_0_PROPERTIES_SSL_TRUSTSTORE_PASSWORD: KafkaSecurePass123
+      KAFKA_CLUSTERS_0_PROPERTIES_SSL_KEYSTORE_LOCATION: /etc/kafka-ui/ssl/client.keystore.jks
+      KAFKA_CLUSTERS_0_PROPERTIES_SSL_KEYSTORE_PASSWORD: KafkaSecurePass123
+      KAFKA_CLUSTERS_0_PROPERTIES_SSL_KEY_PASSWORD: KafkaSecurePass123
+      KAFKA_CLUSTERS_0_PROPERTIES_SSL_ENDPOINT_IDENTIFICATION_ALGORITHM: ""
+    volumes:
+      # Sola lettura: la UI non deve poter modificare i certificati
+      - ./sicurezza/certs/kafka.truststore.jks:/etc/kafka-ui/ssl/kafka.truststore.jks:ro
+      - ./sicurezza/certs/client.keystore.jks:/etc/kafka-ui/ssl/client.keystore.jks:ro
+    networks:
+      - kafka-secure-net
+
+# ------------------------------------------------------------------------------
+# Rete dedicata: i servizi si raggiungono per nome host (kafka1, kafka2, ...)
+# ------------------------------------------------------------------------------
+networks:
+  kafka-secure-net:
+    driver: bridge

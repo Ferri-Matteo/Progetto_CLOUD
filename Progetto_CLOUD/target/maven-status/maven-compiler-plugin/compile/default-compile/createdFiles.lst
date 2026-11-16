@@ -1,0 +1,6 @@
+org\example\OrderDispatcherProducer.class
+org\example\Sicurezza\SimulazioneAttacchi\FullAccessAttacker.class
+org\example\Sicurezza\SimulazioneAttacchi\NoCertAttacker.class
+org\example\Sicurezza\EnterpriseDefenseConsole.class
+org\example\OrderDispatcherConsumer.class
+org\example\Sicurezza\SimulazioneAttacchi\DoSAttacker.class
